@@ -9,10 +9,12 @@ from playwright.sync_api import sync_playwright
 # ==============================================================================
 # KONFIGURATION & UMGEBUNGSVARIABLEN
 # ==============================================================================
-SCRIPT_VERSION = "v7-clean-click-fix"
+SCRIPT_VERSION = "v9-secrets-matched"
 
+# Liest exakt deine GitHub Secrets (ALDI_NUMMER, ALDI_PASSWORT, DISCORD_WEBHOOK_URL)
 PHONE = (
-    os.getenv("ALDI_PHONE")
+    os.getenv("ALDI_NUMMER")
+    or os.getenv("ALDI_PHONE")
     or os.getenv("ALDITALK_PHONE")
     or os.getenv("PHONE_NUMBER")
     or os.getenv("ALDI_USER")
@@ -21,7 +23,8 @@ PHONE = (
 ).strip()
 
 PASSWORD = (
-    os.getenv("ALDI_PASSWORD")
+    os.getenv("ALDI_PASSWORT")
+    or os.getenv("ALDI_PASSWORD")
     or os.getenv("ALDITALK_PASSWORD")
     or os.getenv("PASSWORD")
     or os.getenv("ALDI_PASS")
@@ -29,9 +32,10 @@ PASSWORD = (
 ).strip()
 
 DISCORD_WEBHOOK = (
-    os.getenv("DISCORD_WEBHOOK")
-    or os.getenv("DISCORD_WEBHOOK_URL")
+    os.getenv("DISCORD_WEBHOOK_URL")
+    or os.getenv("DISCORD_WEBHOOK")
     or os.getenv("WEBHOOK_URL")
+    or os.getenv("DISCORD_URL")
     or ""
 ).strip()
 
@@ -50,11 +54,27 @@ def log(msg: str):
     print(f"[{now}] {msg}", flush=True)
 
 
-def send_discord(message: str):
+def send_discord(title: str, description: str, color: int = 0x2ECC71):
+    """Sendet eine formatierte Nachricht an deinen Discord-Webhook."""
     if not DISCORD_WEBHOOK:
+        log("HINWEIS: Kein DISCORD_WEBHOOK_URL gesetzt – überspringe Discord-Nachricht.")
         return
+
+    now_str = datetime.now().strftime("%d.%m.%Y um %H:%M:%S Uhr")
+    payload = {
+        "username": "ALDI TALK Refill Bot",
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": color,
+                "footer": {"text": f"{SCRIPT_VERSION} • {now_str}"},
+            }
+        ],
+    }
+
     try:
-        data = json.dumps({"content": message}).encode("utf-8")
+        data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             DISCORD_WEBHOOK,
             data=data,
@@ -62,10 +82,12 @@ def send_discord(message: str):
                 "Content-Type": "application/json",
                 "User-Agent": "AldiRefillBot/1.0",
             },
+            method="POST",
         )
-        urllib.request.urlopen(req, timeout=10)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            log(f"Discord-Nachricht erfolgreich gesendet (HTTP {resp.status}).")
     except Exception as e:
-        log(f"Discord-Fehler: {e}")
+        log(f"Fehler beim Senden an Discord: {e}")
 
 
 def dismiss_cookies(page):
@@ -168,7 +190,7 @@ def trigger_1gb_refill(page) -> bool:
     except Exception as e:
         log(f"Hinweis bei Methode 1/2: {e}")
 
-    # Methode 3: JavaScript Shadow-DOM Event-Dispatch (falls Event-Listener am inneren Button hängt)
+    # Methode 3: JavaScript Shadow-DOM Event-Dispatch
     try:
         js_res = page.evaluate(
             """() => {
@@ -205,7 +227,7 @@ def main():
     log(f"Skript-Version: {SCRIPT_VERSION}")
 
     if not PHONE or not PASSWORD:
-        log("FEHLER: Telefonnummer oder Passwort fehlen in den Umgebungsvariablen!")
+        log("FEHLER: ALDI_NUMMER oder ALDI_PASSWORT fehlen in den Umgebungsvariablen!")
         sys.exit(1)
 
     with sync_playwright() as p:
@@ -359,8 +381,21 @@ def main():
             )
 
             if (new_gb is not None and rem_gb is not None and new_gb > rem_gb + 0.05) or not btn_still_there:
-                log(f"ERFOLG! +1 GB wurde gebucht! (Vorher: {rem_gb:.3f} GB -> Nachher: {new_gb} GB)")
-                send_discord(f"✅ **ALDI TALK:** +1 GB erfolgreich nachgebucht! Neues Volumen: **{new_gb:.2f} GB**")
+                old_str = f"{rem_gb:.2f} GB ({rem_gb * 1024:.0f} MB)" if rem_gb is not None else "Unbekannt"
+                new_str = f"{new_gb:.2f} GB" if new_gb is not None else "+1 GB gebucht"
+
+                log(f"ERFOLG! +1 GB wurde gebucht! (Vorher: {old_str} -> Nachher: {new_str})")
+
+                # Discord-Benachrichtigung an DISCORD_WEBHOOK_URL senden
+                send_discord(
+                    title="✅ +1 GB erfolgreich nachgebucht!",
+                    description=(
+                        f"Dein **ALDI TALK** Datenvolumen wurde automatisch aufgefüllt.\n\n"
+                        f"📉 **Vorher:** `{old_str}`\n"
+                        f"📈 **Jetzt:** `{new_str}`"
+                    ),
+                    color=0x2ECC71,
+                )
                 sys.exit(0)
             else:
                 log("Kein Volumen-Anstieg nach dem Klick erkennbar. Speichere debug.png und debug.html ...")
