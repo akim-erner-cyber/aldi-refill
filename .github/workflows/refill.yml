@@ -1,0 +1,40 @@
+name: AldiTalk Auto-Refill
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  refill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Code holen
+        uses: actions/checkout@v4
+
+      - name: Python installieren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Playwright installieren
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Nachbuchen pruefen
+        env:
+          ALDI_NUMMER: ${{ secrets.ALDI_NUMMER }}
+          ALDI_PASSWORT: ${{ secrets.ALDI_PASSWORT }}
+          SCHWELLE_GB: "1.0"
+          DRY_RUN: "1"
+        run: python aldi_refill.py
+
+      - name: Screenshot hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug.png
+          if-no-files-found: ignore
