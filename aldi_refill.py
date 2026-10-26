@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ALDI TALK Auto-Refill: bucht das gratis 1 GB automatisch nach."""
+"""ALDI TALK Auto-Refill mit DOM-Diagnose."""
 
 import asyncio
 import datetime
@@ -18,6 +18,66 @@ SCHWELLE_GB = float(os.environ.get("SCHWELLE_GB", "1.0"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+JS_FIND = r"""
+() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const nodes = [];
+  const walk = (root) => {
+    root.querySelectorAll('*').forEach(el => {
+      nodes.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    });
+  };
+  walk(document);
+
+  const kand = nodes.filter(el => {
+    const t = norm(el.textContent);
+    return t && t.length <= 40 && /^\+?\s*1\s*GB$/.test(t);
+  });
+  kand.sort((a, b) => norm(a.textContent).length - norm(b.textContent).length);
+
+  const btns = Array.from(document.querySelectorAll('button, one-button, [role="button"]'))
+    .map(el => el.tagName + ' | class=' + el.className + ' | text=' + norm(el.textContent).slice(0, 50))
+    .slice(0, 40);
+
+  return {
+    treffer: kand.length,
+    liste: kand.slice(0, 10).map(el => el.tagName + ' | class=' + el.className + ' | text=' + norm(el.textContent)),
+    buttons: btns
+  };
+}
+"""
+
+JS_CLICK = r"""
+(level) => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const nodes = [];
+  const walk = (root) => {
+    root.querySelectorAll('*').forEach(el => {
+      nodes.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    });
+  };
+  walk(document);
+
+  const kand = nodes.filter(el => {
+    const t = norm(el.textContent);
+    return t && t.length <= 40 && /^\+?\s*1\s*GB$/.test(t);
+  });
+  kand.sort((a, b) => norm(a.textContent).length - norm(b.textContent).length);
+
+  let z = kand[0];
+  if (!z) return 'nichts';
+  for (let i = 0; i < level; i++) {
+    z = z.parentElement;
+    if (!z) return 'nichts';
+  }
+  z.scrollIntoView({ block: 'center' });
+  z.click();
+  return z.tagName + ' | class=' + z.className;
+}
+"""
 
 
 def log(msg):
@@ -92,69 +152,81 @@ async def durchlauf():
             await page.goto(PORTAL, wait_until="domcontentloaded", timeout=60_000)
             if "login" in page.url:
                 await login(page)
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
 
             gb, text = await restvolumen(page)
             log(f"Restvolumen: {gb} GB" if gb is not None else "Restvolumen nicht erkannt")
 
-            if gb is not None and gb > SCHWELLE_GB:
-                log(f"Ueber Schwelle ({SCHWELLE_GB} GB) - nichts zu tun.")
-                return
+            info = await page.evaluate(JS_FIND)
+            log(f"Elemente mit '+1 GB': {info['treffer']}")
+            for z in info["liste"]:
+                log("  TREFFER: " + z)
+            for z in info["buttons"][:25]:
+                log("  BTN: " + z)
 
             if "Bestellung erhalten" in text or "eingegangen" in text:
-                log("Nachbuchung ist schon unterwegs - warte auf naechsten Lauf.")
-                return
+                log("Nachbuchung ist schon unterwegs - warte.")
+                return "pending"
 
-            btn = None
-            for sel in [
-                'button:has-text("+1 GB")',
-                'one-button:has-text("+1 GB")',
-                'text="+1 GB"',
-                '[class*="refill"]',
-            ]:
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    btn = loc.first
-                    log(f"Button gefunden via {sel}")
-                    break
-
-            if btn is None:
-                log("Kein +1-GB-Button gefunden.")
-                return
+            if gb is not None and gb > SCHWELLE_GB:
+                log(f"Ueber Schwelle ({SCHWELLE_GB} GB) - nichts zu tun.")
+                return "ok"
 
             if DRY_RUN:
                 log("DRY_RUN aktiv - kein Klick.")
-                return
+                return "dryrun"
 
-            log("Klicke +1 GB ...")
-            await btn.click(force=True)
-            await page.wait_for_timeout(2500)
-
-            for sel in [
-                'one-button:has-text("Bestaetigen")',
-                'button:has-text("Bestaetigen")',
-                'one-button:has-text("Nachbuchen")',
-                'button:has-text("Nachbuchen")',
-            ]:
-                try:
-                    await page.locator(sel).last.click(timeout=2500)
-                    log(f"Dialog bestaetigt via {sel}")
-                    await page.wait_for_timeout(2500)
+            gebucht = False
+            for level in range(4):
+                ziel = await page.evaluate(JS_CLICK, level)
+                log(f"Klick-Versuch Stufe {level}: {ziel}")
+                if ziel == "nichts":
                     break
-                except Exception:
-                    continue
+                await page.wait_for_timeout(3000)
 
-            nach = await page.locator("body").inner_text()
-            if "Bestellung erhalten" in nach or "eingegangen" in nach:
+                seite = await page.locator("body").inner_text()
+                if "Bestellung erhalten" in seite or "eingegangen" in seite:
+                    gebucht = True
+                    break
+
+                for sel in [
+                    'one-button:has-text("Bestaetigen")',
+                    'button:has-text("Bestaetigen")',
+                    'one-button:has-text("Nachbuchen")',
+                    'button:has-text("Nachbuchen")',
+                    'one-button:has-text("Ja")',
+                ]:
+                    try:
+                        await page.locator(sel).last.click(timeout=2000)
+                        log(f"Dialog bestaetigt via {sel}")
+                        await page.wait_for_timeout(3000)
+                        seite = await page.locator("body").inner_text()
+                        if "Bestellung erhalten" in seite or "eingegangen" in seite:
+                            gebucht = True
+                        break
+                    except Exception:
+                        continue
+                if gebucht:
+                    break
+
+            if gebucht:
                 log("ERFOLG: 1 GB wurde nachgebucht.")
                 notify("ALDI TALK: gratis 1 GB automatisch nachgebucht.")
-            else:
-                log("Ergebnis unklar - siehe debug.png im Artefakt.")
+                return "booked"
+            log("Kein Erfolg erkennbar - siehe debug.png und debug.html.")
+            return "unclear"
+
         except Exception as e:
             log(f"Fehler: {e}")
+            return "error"
         finally:
             try:
                 await page.screenshot(path="debug.png", full_page=True)
+            except Exception:
+                pass
+            try:
+                with open("debug.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
             except Exception:
                 pass
             await ctx.close()
@@ -162,4 +234,7 @@ async def durchlauf():
 
 
 if __name__ == "__main__":
-    asyncio.run(durchlauf())
+    ergebnis = asyncio.run(durchlauf())
+    log(f"Ergebnis: {ergebnis}")
+    if ergebnis in ("error", "unclear"):
+        sys.exit(1)
