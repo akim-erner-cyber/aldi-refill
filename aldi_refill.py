@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ALDI TALK Auto-Refill mit robustem Button-Finder, Positions-Fallback und DOM-Diagnose."""
+"""ALDI TALK Auto-Refill mit robustem Button-Finder, Positions-Fallback, DOM-Diagnose und Discord-Benachrichtigung."""
 
 import asyncio
 import datetime
@@ -20,10 +20,11 @@ DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # Auf "0" setzen, wenn debug.png/debug.html nicht erzeugt werden sollen
 # (enthalten Kontodaten - nie in ein oeffentliches Repo committen!)
 DEBUG_FILES = os.environ.get("DEBUG_FILES", "1") == "1"
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# "1" = auch bei Fehlern/unklarem Ergebnis eine Discord-Nachricht senden
+NOTIFY_FEHLER = os.environ.get("NOTIFY_FEHLER", "0") == "1"
 
-SCRIPT_VERSION = "v4-one-button"
+SCRIPT_VERSION = "v5-discord"
 
 # Passt auf "+1 GB", "+ 1 GB", "1 GB nachbuchen", "1GB hinzubuchen" usw.
 PLUS_1GB = re.compile(r"\+?\s*1\s*GB", re.I)
@@ -77,18 +78,24 @@ def log(msg):
 
 
 def notify(text):
-    if not (TG_TOKEN and TG_CHAT):
+    """Schickt eine Nachricht per Discord-Webhook."""
+    if not DISCORD_WEBHOOK_URL:
         return
     try:
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data=json.dumps({"chat_id": TG_CHAT, "text": text}).encode(),
-            headers={"Content-Type": "application/json"},
+            DISCORD_WEBHOOK_URL,
+            data=json.dumps({"content": text[:1900]}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                # Ohne User-Agent blockt Discord/Cloudflare Python-Requests (HTTP 403)
+                "User-Agent": "aldi-refill/1.0",
+            },
+            method="POST",
         )
         urllib.request.urlopen(req, timeout=15)
-        log("Telegram-Nachricht gesendet.")
+        log("Discord-Nachricht gesendet.")
     except Exception as e:
-        log(f"Telegram-Fehler: {e}")
+        log(f"Discord-Fehler: {e}")
 
 
 async def login(page):
@@ -286,7 +293,7 @@ async def durchlauf():
 
             if gebucht:
                 log("ERFOLG: 1 GB wurde nachgebucht.")
-                notify("ALDI TALK: gratis 1 GB automatisch nachgebucht.")
+                notify("ALDI TALK: 1 GB automatisch nachgebucht.")
                 return "booked"
 
             log("Kein Erfolg erkennbar - Zustand nach dem Klick:")
@@ -315,5 +322,7 @@ async def durchlauf():
 if __name__ == "__main__":
     ergebnis = asyncio.run(durchlauf())
     log(f"Ergebnis: {ergebnis}")
+    if NOTIFY_FEHLER and ergebnis in ("error", "unclear"):
+        notify(f"ALDI TALK Auto-Refill: Ergebnis '{ergebnis}' - bitte Log pruefen.")
     if ergebnis in ("error", "unclear"):
         sys.exit(1)
