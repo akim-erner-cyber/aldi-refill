@@ -9,10 +9,12 @@ from playwright.sync_api import sync_playwright
 # ==============================================================================
 # KONFIGURATION & UMGEBUNGSVARIABLEN
 # ==============================================================================
-SCRIPT_VERSION = "v8-discord-notify"
+SCRIPT_VERSION = "v11-secret-keys-fix"
 
+# Liest exakt deine GitHub Secrets (ALDI_NUMMER, ALDI_PASSWORT, DISCORD_WEBHOOK_URL)
 PHONE = (
-    os.getenv("ALDI_PHONE")
+    os.getenv("ALDI_NUMMER")
+    or os.getenv("ALDI_PHONE")
     or os.getenv("ALDITALK_PHONE")
     or os.getenv("PHONE_NUMBER")
     or os.getenv("ALDI_USER")
@@ -21,17 +23,17 @@ PHONE = (
 ).strip()
 
 PASSWORD = (
-    os.getenv("ALDI_PASSWORD")
+    os.getenv("ALDI_PASSWORT")
+    or os.getenv("ALDI_PASSWORD")
     or os.getenv("ALDITALK_PASSWORD")
     or os.getenv("PASSWORD")
     or os.getenv("ALDI_PASS")
     or ""
 ).strip()
 
-# Unterstützt alle gängigen Variablennamen für den Discord Webhook
 DISCORD_WEBHOOK = (
-    os.getenv("DISCORD_WEBHOOK")
-    or os.getenv("DISCORD_WEBHOOK_URL")
+    os.getenv("DISCORD_WEBHOOK_URL")
+    or os.getenv("DISCORD_WEBHOOK")
     or os.getenv("WEBHOOK_URL")
     or os.getenv("DISCORD_URL")
     or ""
@@ -53,9 +55,9 @@ def log(msg: str):
 
 
 def send_discord(title: str, description: str, color: int = 0x2ECC71):
-    """Sendet eine formatierte Nachricht an den Discord-Webhook."""
+    """Sendet eine formatierte Nachricht an deinen Discord-Webhook."""
     if not DISCORD_WEBHOOK:
-        log("HINWEIS: Kein DISCORD_WEBHOOK gesetzt – überspringe Discord-Nachricht.")
+        log("HINWEIS: Kein DISCORD_WEBHOOK_URL gesetzt – überspringe Discord-Nachricht.")
         return
 
     now_str = datetime.now().strftime("%d.%m.%Y um %H:%M:%S Uhr")
@@ -146,7 +148,6 @@ def trigger_1gb_refill(page) -> bool:
     """
     clicked = False
 
-    # Methode 1: Gezielter Locator auf one-button im Inland Usage-Meter
     try:
         btn_locator = (
             page.locator("one-usage-meter")
@@ -162,7 +163,6 @@ def trigger_1gb_refill(page) -> bool:
             btn_locator.scroll_into_view_if_needed()
             page.wait_for_timeout(500)
 
-            # Versuche zuerst auf das innere <button> Element im Shadow-DOM zu klicken
             inner_btn = btn_locator.locator("button").first
             if inner_btn.count() > 0:
                 inner_btn.click(force=True)
@@ -173,7 +173,6 @@ def trigger_1gb_refill(page) -> bool:
                 log("Methode 1b: <one-button> per Playwright-Locator geklickt.")
                 clicked = True
 
-            # Methode 2: Echter Hardware-Mausklick auf die Mitte des runden +1 GB Buttons
             box = btn_locator.bounding_box()
             if box:
                 cx = box["x"] + box["width"] / 2
@@ -188,7 +187,6 @@ def trigger_1gb_refill(page) -> bool:
     except Exception as e:
         log(f"Hinweis bei Methode 1/2: {e}")
 
-    # Methode 3: JavaScript Shadow-DOM Event-Dispatch
     try:
         js_res = page.evaluate(
             """() => {
@@ -225,7 +223,7 @@ def main():
     log(f"Skript-Version: {SCRIPT_VERSION}")
 
     if not PHONE or not PASSWORD:
-        log("FEHLER: Telefonnummer oder Passwort fehlen in den Umgebungsvariablen!")
+        log("FEHLER: ALDI_NUMMER oder ALDI_PASSWORT fehlen in den Umgebungsvariablen!")
         sys.exit(1)
 
     with sync_playwright() as p:
@@ -248,29 +246,33 @@ def main():
             dismiss_cookies(page)
 
             # Login-Formular ausfüllen, falls wir noch nicht auf der Übersicht sind
-            if "uebersicht" not in page.url or page.locator("input[type='password']").count() > 0:
+            if "uebersicht" not in page.url or page.locator("input[type='password']:not(.hidden)").count() == 0:
                 dismiss_cookies(page)
 
-                # Rufnummer eingeben
+                # 1. Rufnummer eingeben
                 filled_user = False
                 for sel in [
                     "input[type='tel']",
                     "input[name*='phone' i]",
                     "input[name*='user' i]",
                     "input[id*='phone' i]",
+                    "input[id*='idToken1']",
                     "input[type='text']",
                 ]:
                     loc = page.locator(sel).first
-                    if loc.count() > 0 and loc.is_visible():
-                        loc.fill(PHONE)
-                        filled_user = True
-                        break
+                    if loc.count() > 0:
+                        try:
+                            loc.fill(PHONE)
+                            filled_user = True
+                            break
+                        except Exception:
+                            pass
 
                 if not filled_user:
                     page.evaluate(
                         """(phone) => {
                         const inputs = Array.from(document.querySelectorAll('input'));
-                        const tel = inputs.find(i => i.type === 'tel' || i.type === 'text');
+                        const tel = inputs.find(i => i.type === 'tel' || i.type === 'text' || i.id.includes('Token1'));
                         if (tel) {
                             tel.focus();
                             tel.value = phone;
@@ -281,14 +283,27 @@ def main():
                         PHONE,
                     )
 
-                # Passwort eingeben
-                pw_loc = page.locator("input[type='password']").first
+                # 2. Auf "Weiter" klicken, damit das Passwortfeld erscheint
+                log("Klicke 'Weiter' nach Eingabe der Rufnummer...")
+                next_btn = page.locator(
+                    "button[type='submit'], one-button[type='submit'], button:has-text('Weiter'), one-button:has-text('Weiter'), button:has-text('Nächste'), one-button:has-text('Nächste')"
+                ).first
+                if next_btn.count() > 0:
+                    next_btn.click(force=True)
+                else:
+                    page.keyboard.press("Enter")
+
+                page.wait_for_timeout(3000)
+                dismiss_cookies(page)
+
+                # 3. Passwort eingeben
+                pw_loc = page.locator("input[type='password']:not(.hidden)").first
                 pw_loc.wait_for(state="visible", timeout=15000)
                 pw_loc.fill(PASSWORD)
 
-                # Anmelden klicken
+                # 4. Anmelden klicken
                 submit_btn = page.locator(
-                    "button[type='submit'], one-button[type='submit'], button:has-text('Anmelden'), one-button:has-text('Anmelden')"
+                    "button[type='submit'], one-button[type='submit'], button:has-text('Anmelden'), one-button:has-text('Anmelden'), button:has-text('Login')"
                 ).first
                 if submit_btn.count() > 0:
                     submit_btn.click()
@@ -310,7 +325,6 @@ def main():
                 log(f"Volumen ({rem_gb:.3f} GB) ist noch ueber dem Schwellenwert ({THRESHOLD_GB} GB). Nichts zu tun.")
                 sys.exit(0)
 
-            # Netzwerk-Traffic mitschneiden, um zu sehen, ob der Klick einen API-Call auslöst
             api_responses = []
 
             def on_response(response):
@@ -332,7 +346,6 @@ def main():
             log("Warte 5 Sekunden auf Backend-Reaktion oder Bestaetigungs-Popup ...")
             page.wait_for_timeout(5000)
 
-            # Falls ein Bestätigungs-Modal aufgeht (z.B. "Jetzt buchen" / "Bestätigen"), dieses auch anklicken
             modal_btn = page.evaluate(
                 """() => {
                 const allBtns = Array.from(document.querySelectorAll('one-button, button'));
@@ -368,7 +381,6 @@ def main():
             new_gb = parse_remaining_gb(page)
             log(f"Restvolumen nach Reload: {new_gb} GB")
 
-            # Prüfen, ob der +1 GB Button verschwunden ist oder das Volumen gestiegen ist
             btn_still_there = (
                 page.locator("one-usage-meter")
                 .filter(has_text="Inland")
@@ -384,7 +396,6 @@ def main():
 
                 log(f"ERFOLG! +1 GB wurde gebucht! (Vorher: {old_str} -> Nachher: {new_str})")
 
-                # Discord-Benachrichtigung bei erfolgreicher Nachbuchung senden
                 send_discord(
                     title="✅ +1 GB erfolgreich nachgebucht!",
                     description=(
