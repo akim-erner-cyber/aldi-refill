@@ -1,42 +1,47 @@
-name: AldiTalk Auto-Refill
+name: aldi-refill
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"   # alle 30 Minuten, nach Bedarf anpassen
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1 = nur testen, 0 = wirklich buchen"
+        default: "0"
 
 jobs:
   refill:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Code holen
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Python installieren
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Playwright installieren
+      - name: Abhaengigkeiten installieren
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Nachbuchen pruefen
+      - name: Refill ausfuehren
         env:
           ALDI_NUMMER: ${{ secrets.ALDI_NUMMER }}
           ALDI_PASSWORT: ${{ secrets.ALDI_PASSWORT }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SCHWELLE_GB: "1.0"
-          DRY_RUN: "1"
+          NOTIFY_FEHLER: "0"   # "1" = auch bei Fehlern eine Discord-Nachricht
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python aldi_refill.py
 
-      - name: Debug-Dateien hochladen
+      - name: Debug-Dateien als privates Artifact speichern
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-dateien
+          name: debug
           path: |
             debug.png
             debug.html
           if-no-files-found: ignore
+          retention-days: 3
