@@ -31,10 +31,12 @@ jobs:
           DRY_RUN: "1"
         run: python aldi_refill.py
 
-      - name: Screenshot hochladen
+      - name: Debug-Dateien hochladen
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshot
-          path: debug.png
+          name: debug-dateien
+          path: |
+            debug.png
+            debug.html
           if-no-files-found: ignore
