@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ALDI TALK Auto-Refill mit DOM-Diagnose."""
-
+"""ALDI TALK Auto-Refill mit robustem Button-Finder und DOM-Diagnose."""
+ 
 import asyncio
 import datetime
 import json
@@ -8,18 +8,28 @@ import os
 import re
 import sys
 import urllib.request
-
+ 
 from playwright.async_api import async_playwright
-
+ 
 PORTAL = "https://www.alditalk-kundenportal.de/portal/auth/uebersicht/"
+ 
 NUMMER = os.environ.get("ALDI_NUMMER", "")
 PASSWORT = os.environ.get("ALDI_PASSWORT", "")
 SCHWELLE_GB = float(os.environ.get("SCHWELLE_GB", "1.0"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+# Auf "0" setzen, wenn debug.png/debug.html nicht erzeugt werden sollen
+# (enthalten Kontodaten - nie in ein oeffentliches Repo committen!)
+DEBUG_FILES = os.environ.get("DEBUG_FILES", "1") == "1"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-JS_FIND = r"""
+ 
+# Passt auf "+1 GB", "+ 1 GB", "1 GB nachbuchen", "1GB hinzubuchen" usw.
+PLUS_1GB = re.compile(r"\+?\s*1\s*GB", re.I)
+DIALOG_BTN = re.compile(r"Best(ä|ae)tigen|Nachbuchen|Kostenpflichtig|^\s*Ja\s*$", re.I)
+ 
+# Diagnose: listet alle Elemente (inkl. offener Shadow-DOMs) mit "1 GB"
+# im Text oder in label/aria-label/title sowie alle Buttons.
+JS_DIAG = r"""
 () => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const nodes = [];
@@ -30,60 +40,38 @@ JS_FIND = r"""
     });
   };
   walk(document);
-
-  const kand = nodes.filter(el => {
+ 
+  const desc = el => el.tagName
+    + ' | class=' + (el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className)
+    + ' | text=' + norm(el.textContent).slice(0, 60)
+    + ' | label=' + (el.getAttribute('label') || '')
+    + ' | aria=' + (el.getAttribute('aria-label') || '')
+    + ' | title=' + (el.getAttribute('title') || '');
+ 
+  const treffer = nodes.filter(el => {
     const t = norm(el.textContent);
-    return t && t.length <= 40 && /^\+?\s*1\s*GB$/.test(t);
+    const attrs = (el.getAttribute('label') || '') + ' ' + (el.getAttribute('aria-label') || '')
+      + ' ' + (el.getAttribute('title') || '');
+    return (t.length <= 60 && /1\s*GB/i.test(t)) || /1\s*GB/i.test(attrs);
   });
-  kand.sort((a, b) => norm(a.textContent).length - norm(b.textContent).length);
-
-  const btns = Array.from(document.querySelectorAll('button, one-button, [role="button"]'))
-    .map(el => el.tagName + ' | class=' + el.className + ' | text=' + norm(el.textContent).slice(0, 50))
-    .slice(0, 40);
-
+ 
+  const btns = nodes.filter(el =>
+    el.matches && el.matches('button, one-button, a, [role="button"]')
+  );
+ 
   return {
-    treffer: kand.length,
-    liste: kand.slice(0, 10).map(el => el.tagName + ' | class=' + el.className + ' | text=' + norm(el.textContent)),
-    buttons: btns
+    treffer: treffer.length,
+    liste: treffer.slice(0, 15).map(desc),
+    buttons: btns.slice(0, 40).map(desc),
   };
 }
 """
-
-JS_CLICK = r"""
-(level) => {
-  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-  const nodes = [];
-  const walk = (root) => {
-    root.querySelectorAll('*').forEach(el => {
-      nodes.push(el);
-      if (el.shadowRoot) walk(el.shadowRoot);
-    });
-  };
-  walk(document);
-
-  const kand = nodes.filter(el => {
-    const t = norm(el.textContent);
-    return t && t.length <= 40 && /^\+?\s*1\s*GB$/.test(t);
-  });
-  kand.sort((a, b) => norm(a.textContent).length - norm(b.textContent).length);
-
-  let z = kand[0];
-  if (!z) return 'nichts';
-  for (let i = 0; i < level; i++) {
-    z = z.parentElement;
-    if (!z) return 'nichts';
-  }
-  z.scrollIntoView({ block: 'center' });
-  z.click();
-  return z.tagName + ' | class=' + z.className;
-}
-"""
-
-
+ 
+ 
 def log(msg):
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
-
-
+ 
+ 
 def notify(text):
     if not (TG_TOKEN and TG_CHAT):
         return
@@ -97,8 +85,8 @@ def notify(text):
         log("Telegram-Nachricht gesendet.")
     except Exception as e:
         log(f"Telegram-Fehler: {e}")
-
-
+ 
+ 
 async def login(page):
     log("Login laeuft ...")
     try:
@@ -114,8 +102,8 @@ async def login(page):
     await page.locator('one-button[id="IDToken5_4_od_2"]').click()
     await page.wait_for_url(lambda u: "login" not in u, timeout=90_000)
     log("Login OK.")
-
-
+ 
+ 
 async def restvolumen(page):
     text = await page.locator("body").inner_text()
     m = re.search(r"Noch\s+([\d.,]+)\s*(GB|MB|KB)", text)
@@ -130,13 +118,60 @@ async def restvolumen(page):
     elif m.group(2) == "KB":
         wert /= 1024 * 1024
     return wert, text
-
-
+ 
+ 
+async def diagnose(page):
+    """Loggt gefundene Kandidaten in allen Frames."""
+    for i, frame in enumerate(page.frames):
+        try:
+            info = await frame.evaluate(JS_DIAG)
+        except Exception as e:
+            log(f"Frame {i}: Diagnose nicht moeglich ({e})")
+            continue
+        log(f"Frame {i} ({frame.url[:80]}): Elemente mit '1 GB': {info['treffer']}")
+        for z in info["liste"]:
+            log("  TREFFER: " + z)
+        for z in info["buttons"][:25]:
+            log("  BTN: " + z)
+ 
+ 
+async def finde_button(page, timeout_s=20):
+    """Sucht den '+1 GB'-Button in allen Frames, wartet bis timeout_s."""
+    for _ in range(timeout_s * 2):
+        for frame in page.frames:
+            kandidaten = (
+                # 1. echte Buttons mit passendem Namen
+                frame.get_by_role("button", name=PLUS_1GB),
+                # 2. Button-artige Elemente mit passendem Text
+                frame.locator("one-button, button, a, [role=button]").filter(has_text=PLUS_1GB),
+                # 3. Label/aria-label/title-Attribute (Web Components)
+                frame.locator(
+                    '[label*="1 GB"], [aria-label*="1 GB"], [title*="1 GB"], '
+                    '[label*="1GB"], [aria-label*="1GB"]'
+                ),
+                # 4. Notnagel: irgendein Element mit passendem Text
+                frame.get_by_text(PLUS_1GB),
+            )
+            for loc in kandidaten:
+                try:
+                    if await loc.count():
+                        return loc.first
+                except Exception:
+                    continue
+        await page.wait_for_timeout(500)
+    return None
+ 
+ 
+async def seite_zeigt_bestellung(page):
+    seite = await page.locator("body").inner_text()
+    return "Bestellung erhalten" in seite or "eingegangen" in seite
+ 
+ 
 async def durchlauf():
     if not NUMMER or not PASSWORT:
         log("ALDI_NUMMER oder ALDI_PASSWORT fehlt.")
         sys.exit(2)
-
+ 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -152,89 +187,99 @@ async def durchlauf():
             await page.goto(PORTAL, wait_until="domcontentloaded", timeout=60_000)
             if "login" in page.url:
                 await login(page)
+ 
+            # SPA laden lassen
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
             await page.wait_for_timeout(5000)
-
+ 
             gb, text = await restvolumen(page)
             log(f"Restvolumen: {gb} GB" if gb is not None else "Restvolumen nicht erkannt")
-
-            info = await page.evaluate(JS_FIND)
-            log(f"Elemente mit '+1 GB': {info['treffer']}")
-            for z in info["liste"]:
-                log("  TREFFER: " + z)
-            for z in info["buttons"][:25]:
-                log("  BTN: " + z)
-
+ 
+            await diagnose(page)
+ 
             if "Bestellung erhalten" in text or "eingegangen" in text:
                 log("Nachbuchung ist schon unterwegs - warte.")
                 return "pending"
-
+ 
             if gb is not None and gb > SCHWELLE_GB:
                 log(f"Ueber Schwelle ({SCHWELLE_GB} GB) - nichts zu tun.")
                 return "ok"
-
+ 
             if DRY_RUN:
                 log("DRY_RUN aktiv - kein Klick.")
                 return "dryrun"
-
-            gebucht = False
-            for level in range(4):
-                ziel = await page.evaluate(JS_CLICK, level)
-                log(f"Klick-Versuch Stufe {level}: {ziel}")
-                if ziel == "nichts":
-                    break
-                await page.wait_for_timeout(3000)
-
-                seite = await page.locator("body").inner_text()
-                if "Bestellung erhalten" in seite or "eingegangen" in seite:
-                    gebucht = True
-                    break
-
-                for sel in [
-                    'one-button:has-text("Bestaetigen")',
-                    'button:has-text("Bestaetigen")',
-                    'one-button:has-text("Nachbuchen")',
-                    'button:has-text("Nachbuchen")',
-                    'one-button:has-text("Ja")',
-                ]:
+ 
+            btn = await finde_button(page)
+            if btn is None:
+                log("Kein '+1 GB'-Button gefunden (wird er evtl. erst bei fast leerem "
+                    "Volumen angezeigt?). Siehe TREFFER/BTN-Zeilen oben und debug.html.")
+                return "unclear"
+ 
+            try:
+                log("Button gefunden: " + (await btn.evaluate("el => el.outerHTML"))[:200])
+            except Exception:
+                pass
+ 
+            await btn.scroll_into_view_if_needed()
+            try:
+                await btn.click(timeout=10_000)
+            except Exception as e:
+                log(f"Normaler Klick fehlgeschlagen ({e}) - versuche force/JS-Klick.")
+                try:
+                    await btn.click(force=True, timeout=5000)
+                except Exception:
+                    await btn.evaluate("el => el.click()")
+            log("+1 GB angeklickt.")
+            await page.wait_for_timeout(3000)
+ 
+            gebucht = await seite_zeigt_bestellung(page)
+ 
+            # Evtl. Bestaetigungsdialog
+            if not gebucht:
+                for frame in page.frames:
                     try:
-                        await page.locator(sel).last.click(timeout=2000)
-                        log(f"Dialog bestaetigt via {sel}")
-                        await page.wait_for_timeout(3000)
-                        seite = await page.locator("body").inner_text()
-                        if "Bestellung erhalten" in seite or "eingegangen" in seite:
-                            gebucht = True
-                        break
+                        dlg = frame.get_by_role("button", name=DIALOG_BTN)
+                        if await dlg.count():
+                            await dlg.last.click(timeout=4000)
+                            log("Dialog bestaetigt.")
+                            await page.wait_for_timeout(3000)
+                            gebucht = await seite_zeigt_bestellung(page)
+                            break
                     except Exception:
                         continue
-                if gebucht:
-                    break
-
+ 
             if gebucht:
                 log("ERFOLG: 1 GB wurde nachgebucht.")
                 notify("ALDI TALK: gratis 1 GB automatisch nachgebucht.")
                 return "booked"
+ 
             log("Kein Erfolg erkennbar - siehe debug.png und debug.html.")
             return "unclear"
-
+ 
         except Exception as e:
             log(f"Fehler: {e}")
             return "error"
         finally:
-            try:
-                await page.screenshot(path="debug.png", full_page=True)
-            except Exception:
-                pass
-            try:
-                with open("debug.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
+            if DEBUG_FILES:
+                try:
+                    await page.screenshot(path="debug.png", full_page=True)
+                except Exception:
+                    pass
+                try:
+                    with open("debug.html", "w", encoding="utf-8") as f:
+                        f.write(await page.content())
+                except Exception:
+                    pass
             await ctx.close()
             await browser.close()
-
-
+ 
+ 
 if __name__ == "__main__":
     ergebnis = asyncio.run(durchlauf())
     log(f"Ergebnis: {ergebnis}")
     if ergebnis in ("error", "unclear"):
         sys.exit(1)
+ 
