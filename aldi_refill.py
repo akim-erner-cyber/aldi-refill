@@ -23,10 +23,12 @@ DEBUG_FILES = os.environ.get("DEBUG_FILES", "1") == "1"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-SCRIPT_VERSION = "v3-fallback"
+SCRIPT_VERSION = "v4-one-button"
 
 # Passt auf "+1 GB", "+ 1 GB", "1 GB nachbuchen", "1GB hinzubuchen" usw.
 PLUS_1GB = re.compile(r"\+?\s*1\s*GB", re.I)
+# Exakter Button-Text (das "+" ist im Portal ein Icon, im Text steht nur "1 GB")
+PLUS_1GB_EXAKT = re.compile(r"^\s*\+?\s*1\s*GB\s*$", re.I)
 DIALOG_BTN = re.compile(r"Best(ä|ae)tigen|Nachbuchen|Kostenpflichtig|^\s*Ja\s*$", re.I)
 
 # Diagnose: listet alle Elemente (inkl. offener Shadow-DOMs) mit "1 GB"
@@ -122,15 +124,15 @@ async def restvolumen(page):
     return wert, text
 
 
-async def diagnose(page):
-    """Loggt gefundene Kandidaten in allen Frames."""
+async def diagnose(page, titel=""):
+    """Loggt gefundene Kandidaten und Buttons in allen Frames."""
     for i, frame in enumerate(page.frames):
         try:
             info = await frame.evaluate(JS_DIAG)
         except Exception as e:
             log(f"Frame {i}: Diagnose nicht moeglich ({e})")
             continue
-        log(f"Frame {i} ({frame.url[:80]}): Elemente mit '1 GB': {info['treffer']}")
+        log(f"{titel}Frame {i} ({frame.url[:80]}): Elemente mit '1 GB': {info['treffer']}")
         for z in info["liste"]:
             log("  TREFFER: " + z)
         for z in info["buttons"][:25]:
@@ -142,6 +144,8 @@ async def finde_button(page, timeout_s=20):
     for _ in range(timeout_s * 2):
         for frame in page.frames:
             kandidaten = (
+                # 0. Exakter Treffer: <one-button> mit Text "1 GB" (so im Portal)
+                frame.locator("one-button").filter(has_text=PLUS_1GB_EXAKT),
                 # 1. echte Buttons mit passendem Namen
                 frame.get_by_role("button", name=PLUS_1GB),
                 # 2. Button-artige Elemente mit passendem Text
@@ -228,11 +232,20 @@ async def durchlauf():
                 log(f"Ueber Schwelle ({SCHWELLE_GB} GB) - nichts zu tun.")
                 return "ok"
 
+            btn = await finde_button(page)
+
             if DRY_RUN:
+                if btn is not None:
+                    try:
+                        log("DRY_RUN: Button WUERDE geklickt: "
+                            + (await btn.evaluate("el => el.outerHTML"))[:300])
+                    except Exception:
+                        log("DRY_RUN: Button gefunden (outerHTML nicht lesbar).")
+                else:
+                    log("DRY_RUN: Kein Button per Locator gefunden (Positions-Fallback wuerde greifen).")
                 log("DRY_RUN aktiv - kein Klick.")
                 return "dryrun"
 
-            btn = await finde_button(page)
             if btn is not None:
                 try:
                     log("Button gefunden: " + (await btn.evaluate("el => el.outerHTML"))[:200])
@@ -276,7 +289,9 @@ async def durchlauf():
                 notify("ALDI TALK: gratis 1 GB automatisch nachgebucht.")
                 return "booked"
 
-            log("Kein Erfolg erkennbar - siehe debug.png und debug.html.")
+            log("Kein Erfolg erkennbar - Zustand nach dem Klick:")
+            await diagnose(page, titel="NACH KLICK: ")
+            log("Siehe auch debug.png und debug.html.")
             return "unclear"
 
         except Exception as e:
