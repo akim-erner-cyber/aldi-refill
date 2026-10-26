@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ALDI TALK Auto-Refill mit robustem Button-Finder und DOM-Diagnose."""
- 
+"""ALDI TALK Auto-Refill mit robustem Button-Finder, Positions-Fallback und DOM-Diagnose."""
+
 import asyncio
 import datetime
 import json
@@ -8,11 +8,11 @@ import os
 import re
 import sys
 import urllib.request
- 
+
 from playwright.async_api import async_playwright
- 
+
 PORTAL = "https://www.alditalk-kundenportal.de/portal/auth/uebersicht/"
- 
+
 NUMMER = os.environ.get("ALDI_NUMMER", "")
 PASSWORT = os.environ.get("ALDI_PASSWORT", "")
 SCHWELLE_GB = float(os.environ.get("SCHWELLE_GB", "1.0"))
@@ -22,11 +22,13 @@ DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 DEBUG_FILES = os.environ.get("DEBUG_FILES", "1") == "1"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
- 
+
+SCRIPT_VERSION = "v3-fallback"
+
 # Passt auf "+1 GB", "+ 1 GB", "1 GB nachbuchen", "1GB hinzubuchen" usw.
 PLUS_1GB = re.compile(r"\+?\s*1\s*GB", re.I)
 DIALOG_BTN = re.compile(r"Best(ä|ae)tigen|Nachbuchen|Kostenpflichtig|^\s*Ja\s*$", re.I)
- 
+
 # Diagnose: listet alle Elemente (inkl. offener Shadow-DOMs) mit "1 GB"
 # im Text oder in label/aria-label/title sowie alle Buttons.
 JS_DIAG = r"""
@@ -40,25 +42,25 @@ JS_DIAG = r"""
     });
   };
   walk(document);
- 
+
   const desc = el => el.tagName
     + ' | class=' + (el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className)
     + ' | text=' + norm(el.textContent).slice(0, 60)
     + ' | label=' + (el.getAttribute('label') || '')
     + ' | aria=' + (el.getAttribute('aria-label') || '')
     + ' | title=' + (el.getAttribute('title') || '');
- 
+
   const treffer = nodes.filter(el => {
     const t = norm(el.textContent);
     const attrs = (el.getAttribute('label') || '') + ' ' + (el.getAttribute('aria-label') || '')
       + ' ' + (el.getAttribute('title') || '');
     return (t.length <= 60 && /1\s*GB/i.test(t)) || /1\s*GB/i.test(attrs);
   });
- 
+
   const btns = nodes.filter(el =>
     el.matches && el.matches('button, one-button, a, [role="button"]')
   );
- 
+
   return {
     treffer: treffer.length,
     liste: treffer.slice(0, 15).map(desc),
@@ -66,12 +68,12 @@ JS_DIAG = r"""
   };
 }
 """
- 
- 
+
+
 def log(msg):
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
- 
- 
+
+
 def notify(text):
     if not (TG_TOKEN and TG_CHAT):
         return
@@ -85,8 +87,8 @@ def notify(text):
         log("Telegram-Nachricht gesendet.")
     except Exception as e:
         log(f"Telegram-Fehler: {e}")
- 
- 
+
+
 async def login(page):
     log("Login laeuft ...")
     try:
@@ -102,8 +104,8 @@ async def login(page):
     await page.locator('one-button[id="IDToken5_4_od_2"]').click()
     await page.wait_for_url(lambda u: "login" not in u, timeout=90_000)
     log("Login OK.")
- 
- 
+
+
 async def restvolumen(page):
     text = await page.locator("body").inner_text()
     m = re.search(r"Noch\s+([\d.,]+)\s*(GB|MB|KB)", text)
@@ -118,8 +120,8 @@ async def restvolumen(page):
     elif m.group(2) == "KB":
         wert /= 1024 * 1024
     return wert, text
- 
- 
+
+
 async def diagnose(page):
     """Loggt gefundene Kandidaten in allen Frames."""
     for i, frame in enumerate(page.frames):
@@ -133,8 +135,8 @@ async def diagnose(page):
             log("  TREFFER: " + z)
         for z in info["buttons"][:25]:
             log("  BTN: " + z)
- 
- 
+
+
 async def finde_button(page, timeout_s=20):
     """Sucht den '+1 GB'-Button in allen Frames, wartet bis timeout_s."""
     for _ in range(timeout_s * 2):
@@ -160,18 +162,36 @@ async def finde_button(page, timeout_s=20):
                     continue
         await page.wait_for_timeout(500)
     return None
- 
- 
+
+
+async def klick_per_position(page):
+    """Fallback: Der runde +1-GB-Button sitzt rechts neben/ueber dem Label 'Inland'
+    des ersten Tachos (~72 px rechts, ~14 px ueber dem Label-Mittelpunkt)."""
+    label = page.get_by_text("Inland", exact=True).first
+    if not await label.count():
+        return False
+    await label.scroll_into_view_if_needed()
+    box = await label.bounding_box()
+    if not box:
+        return False
+    x = box["x"] + box["width"] / 2 + 72
+    y = box["y"] + box["height"] / 2 - 14
+    await page.mouse.click(x, y)
+    log(f"Fallback-Klick per Position ({x:.0f},{y:.0f}).")
+    return True
+
+
 async def seite_zeigt_bestellung(page):
     seite = await page.locator("body").inner_text()
     return "Bestellung erhalten" in seite or "eingegangen" in seite
- 
- 
+
+
 async def durchlauf():
+    log(f"Skript-Version: {SCRIPT_VERSION}")
     if not NUMMER or not PASSWORT:
         log("ALDI_NUMMER oder ALDI_PASSWORT fehlt.")
         sys.exit(2)
- 
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -187,56 +207,56 @@ async def durchlauf():
             await page.goto(PORTAL, wait_until="domcontentloaded", timeout=60_000)
             if "login" in page.url:
                 await login(page)
- 
+
             # SPA laden lassen
             try:
                 await page.wait_for_load_state("networkidle", timeout=20_000)
             except Exception:
                 pass
             await page.wait_for_timeout(5000)
- 
+
             gb, text = await restvolumen(page)
             log(f"Restvolumen: {gb} GB" if gb is not None else "Restvolumen nicht erkannt")
- 
+
             await diagnose(page)
- 
+
             if "Bestellung erhalten" in text or "eingegangen" in text:
                 log("Nachbuchung ist schon unterwegs - warte.")
                 return "pending"
- 
+
             if gb is not None and gb > SCHWELLE_GB:
                 log(f"Ueber Schwelle ({SCHWELLE_GB} GB) - nichts zu tun.")
                 return "ok"
- 
+
             if DRY_RUN:
                 log("DRY_RUN aktiv - kein Klick.")
                 return "dryrun"
- 
+
             btn = await finde_button(page)
-            if btn is None:
-                log("Kein '+1 GB'-Button gefunden (wird er evtl. erst bei fast leerem "
-                    "Volumen angezeigt?). Siehe TREFFER/BTN-Zeilen oben und debug.html.")
-                return "unclear"
- 
-            try:
-                log("Button gefunden: " + (await btn.evaluate("el => el.outerHTML"))[:200])
-            except Exception:
-                pass
- 
-            await btn.scroll_into_view_if_needed()
-            try:
-                await btn.click(timeout=10_000)
-            except Exception as e:
-                log(f"Normaler Klick fehlgeschlagen ({e}) - versuche force/JS-Klick.")
+            if btn is not None:
                 try:
-                    await btn.click(force=True, timeout=5000)
+                    log("Button gefunden: " + (await btn.evaluate("el => el.outerHTML"))[:200])
                 except Exception:
-                    await btn.evaluate("el => el.click()")
-            log("+1 GB angeklickt.")
+                    pass
+                await btn.scroll_into_view_if_needed()
+                try:
+                    await btn.click(timeout=10_000)
+                except Exception as e:
+                    log(f"Normaler Klick fehlgeschlagen ({e}) - versuche force/JS-Klick.")
+                    try:
+                        await btn.click(force=True, timeout=5000)
+                    except Exception:
+                        await btn.evaluate("el => el.click()")
+                log("+1 GB per Locator angeklickt.")
+            else:
+                log("Kein Button per Locator gefunden - versuche Positions-Fallback.")
+                if not await klick_per_position(page):
+                    log("Weder Button noch 'Inland'-Label gefunden. Siehe TREFFER/BTN und debug.html.")
+                    return "unclear"
+
             await page.wait_for_timeout(3000)
- 
             gebucht = await seite_zeigt_bestellung(page)
- 
+
             # Evtl. Bestaetigungsdialog
             if not gebucht:
                 for frame in page.frames:
@@ -250,15 +270,15 @@ async def durchlauf():
                             break
                     except Exception:
                         continue
- 
+
             if gebucht:
                 log("ERFOLG: 1 GB wurde nachgebucht.")
                 notify("ALDI TALK: gratis 1 GB automatisch nachgebucht.")
                 return "booked"
- 
+
             log("Kein Erfolg erkennbar - siehe debug.png und debug.html.")
             return "unclear"
- 
+
         except Exception as e:
             log(f"Fehler: {e}")
             return "error"
@@ -275,11 +295,10 @@ async def durchlauf():
                     pass
             await ctx.close()
             await browser.close()
- 
- 
+
+
 if __name__ == "__main__":
     ergebnis = asyncio.run(durchlauf())
     log(f"Ergebnis: {ergebnis}")
     if ergebnis in ("error", "unclear"):
         sys.exit(1)
- 
