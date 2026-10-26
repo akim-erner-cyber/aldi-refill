@@ -1,47 +1,43 @@
-name: aldi-refill
+name: Aldi Refill Automatisch
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # alle 30 Minuten, nach Bedarf anpassen
+    # Läuft standardmäßig alle 30 Minuten (kannst du anpassen)
+    - cron: '*/30 * * * *'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "1 = nur testen, 0 = wirklich buchen"
-        default: "0"
 
 jobs:
-  refill:
+  run-refill:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Repository auschecken
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Python einrichten
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
 
-      - name: Abhaengigkeiten installieren
+      - name: Abhängigkeiten installieren
         run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          pip install playwright
+          playwright install chromium
 
-      - name: Refill ausfuehren
+      - name: Run python aldi_refill.py
         env:
           ALDI_NUMMER: ${{ secrets.ALDI_NUMMER }}
           ALDI_PASSWORT: ${{ secrets.ALDI_PASSWORT }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SCHWELLE_GB: "1.0"
-          NOTIFY_FEHLER: "0"   # "1" = auch bei Fehlern eine Discord-Nachricht
-          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python aldi_refill.py
 
-      - name: Debug-Dateien als privates Artifact speichern
-        if: always()
+      - name: Debug-Dateien bei Fehler hochladen
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
+          name: debug-dateien
           path: |
             debug.png
             debug.html
-          if-no-files-found: ignore
           retention-days: 3
