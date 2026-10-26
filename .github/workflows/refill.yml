@@ -2,9 +2,9 @@ name: Aldi Refill Automatisch
 
 on:
   schedule:
-    # Läuft standardmäßig alle 30 Minuten (kannst du anpassen)
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    # Läuft jetzt alle 15 Minuten automatisch
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Ermöglicht auch weiterhin den manuellen Start über den "Run workflow"-Button
 
 jobs:
   run-refill:
