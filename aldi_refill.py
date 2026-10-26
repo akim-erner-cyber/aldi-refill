@@ -9,12 +9,10 @@ from playwright.sync_api import sync_playwright
 # ==============================================================================
 # KONFIGURATION & UMGEBUNGSVARIABLEN
 # ==============================================================================
-SCRIPT_VERSION = "v9-secrets-matched"
+SCRIPT_VERSION = "v8-discord-notify"
 
-# Liest exakt deine GitHub Secrets (ALDI_NUMMER, ALDI_PASSWORT, DISCORD_WEBHOOK_URL)
 PHONE = (
-    os.getenv("ALDI_NUMMER")
-    or os.getenv("ALDI_PHONE")
+    os.getenv("ALDI_PHONE")
     or os.getenv("ALDITALK_PHONE")
     or os.getenv("PHONE_NUMBER")
     or os.getenv("ALDI_USER")
@@ -23,17 +21,17 @@ PHONE = (
 ).strip()
 
 PASSWORD = (
-    os.getenv("ALDI_PASSWORT")
-    or os.getenv("ALDI_PASSWORD")
+    os.getenv("ALDI_PASSWORD")
     or os.getenv("ALDITALK_PASSWORD")
     or os.getenv("PASSWORD")
     or os.getenv("ALDI_PASS")
     or ""
 ).strip()
 
+# Unterstützt alle gängigen Variablennamen für den Discord Webhook
 DISCORD_WEBHOOK = (
-    os.getenv("DISCORD_WEBHOOK_URL")
-    or os.getenv("DISCORD_WEBHOOK")
+    os.getenv("DISCORD_WEBHOOK")
+    or os.getenv("DISCORD_WEBHOOK_URL")
     or os.getenv("WEBHOOK_URL")
     or os.getenv("DISCORD_URL")
     or ""
@@ -55,9 +53,9 @@ def log(msg: str):
 
 
 def send_discord(title: str, description: str, color: int = 0x2ECC71):
-    """Sendet eine formatierte Nachricht an deinen Discord-Webhook."""
+    """Sendet eine formatierte Nachricht an den Discord-Webhook."""
     if not DISCORD_WEBHOOK:
-        log("HINWEIS: Kein DISCORD_WEBHOOK_URL gesetzt – überspringe Discord-Nachricht.")
+        log("HINWEIS: Kein DISCORD_WEBHOOK gesetzt – überspringe Discord-Nachricht.")
         return
 
     now_str = datetime.now().strftime("%d.%m.%Y um %H:%M:%S Uhr")
@@ -227,7 +225,7 @@ def main():
     log(f"Skript-Version: {SCRIPT_VERSION}")
 
     if not PHONE or not PASSWORD:
-        log("FEHLER: ALDI_NUMMER oder ALDI_PASSWORT fehlen in den Umgebungsvariablen!")
+        log("FEHLER: Telefonnummer oder Passwort fehlen in den Umgebungsvariablen!")
         sys.exit(1)
 
     with sync_playwright() as p:
@@ -386,7 +384,7 @@ def main():
 
                 log(f"ERFOLG! +1 GB wurde gebucht! (Vorher: {old_str} -> Nachher: {new_str})")
 
-                # Discord-Benachrichtigung an DISCORD_WEBHOOK_URL senden
+                # Discord-Benachrichtigung bei erfolgreicher Nachbuchung senden
                 send_discord(
                     title="✅ +1 GB erfolgreich nachgebucht!",
                     description=(
