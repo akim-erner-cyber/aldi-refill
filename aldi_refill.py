@@ -1,18 +1,16 @@
 import os
 import re
 import sys
-import time
-from datetime import datetime
-import urllib.request
 import json
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import urllib.request
+from datetime import datetime
+from playwright.sync_api import sync_playwright
 
 # ==============================================================================
 # KONFIGURATION & UMGEBUNGSVARIABLEN
 # ==============================================================================
-SCRIPT_VERSION = "v6-shadowdom-fix"
+SCRIPT_VERSION = "v7-clean-click-fix"
 
-# Unterstützt verschiedene gängige Namen für die GitHub Secrets / Env-Variablen
 PHONE = (
     os.getenv("ALDI_PHONE")
     or os.getenv("ALDITALK_PHONE")
@@ -37,7 +35,7 @@ DISCORD_WEBHOOK = (
     or ""
 ).strip()
 
-# Schwellenwert in GB, unter dem nachgebucht werden soll (z. B. 1.05 für ~1024 MB)
+# Ab 1024 MB (1.0 GB) ist der +1 GB Button bei ALDI TALK klickbar
 THRESHOLD_GB = float(os.getenv("THRESHOLD_GB", "1.05"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 
@@ -60,7 +58,10 @@ def send_discord(message: str):
         req = urllib.request.Request(
             DISCORD_WEBHOOK,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "AldiRefillBot/1.0"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AldiRefillBot/1.0",
+            },
         )
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
@@ -68,31 +69,30 @@ def send_discord(message: str):
 
 
 def dismiss_cookies(page):
-    """Schließt das Usercentrics Cookie-Banner, falls vorhanden."""
+    """Schließt das Usercentrics Cookie-Banner oder Hinweise, falls vorhanden."""
     try:
-        page.evaluate("""() => {
-            // 1. Direkt im DOM suchen
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const accept = buttons.find(b => /akzeptieren|alle akzeptieren|zustimmen|accept all/i.test(b.innerText || ''));
-            if (accept) { accept.click(); return true; }
-
-            // 2. Im Usercentrics Shadow DOM suchen
+        page.evaluate(
+            """() => {
             const uc = document.querySelector('#usercentrics-root');
             if (uc && uc.shadowRoot) {
                 const ucBtns = Array.from(uc.shadowRoot.querySelectorAll('button'));
                 const ucAccept = ucBtns.find(b => /akzeptieren|alle akzeptieren|zustimmen|accept all/i.test(b.innerText || ''));
-                if (ucAccept) { ucAccept.click(); return true; }
+                if (ucAccept) { ucAccept.click(); }
             }
-            return false;
-        }""")
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const accept = buttons.find(b => /akzeptieren|alle akzeptieren|zustimmen|accept all/i.test(b.innerText || ''));
+            if (accept) { accept.click(); }
+        }"""
+        )
     except Exception:
         pass
 
 
 def parse_remaining_gb(page) -> float | None:
-    """Liest das verbleibende Inlands-Datenvolumen in GB aus."""
+    """Liest das verbleibende Inlands-Datenvolumen in GB (Basis 1024 MB) aus."""
     try:
-        text = page.evaluate("""() => {
+        text = page.evaluate(
+            """() => {
             const meters = Array.from(document.querySelectorAll('one-usage-meter, one-stack.usage-meter'));
             for (const m of meters) {
                 const t = m.innerText || m.textContent || '';
@@ -101,9 +101,9 @@ def parse_remaining_gb(page) -> float | None:
                 }
             }
             return document.body.innerText || '';
-        }""")
+        }"""
+        )
 
-        # Suche nach Muster wie "Noch 1021,9 MB von 25 GB" oder "Noch 4,5 GB von 25 GB"
         match = re.search(r"Noch\s*([\d.,]+)\s*(MB|GB)", text, re.IGNORECASE)
         if match:
             val_str = match.group(1).replace(".", "").replace(",", ".")
@@ -117,105 +117,85 @@ def parse_remaining_gb(page) -> float | None:
     return None
 
 
-def dump_debug_state(page, prefix=""):
-    """Gibt Debug-Informationen zu allen relevanten Elementen aus."""
-    p = f"{prefix}: " if prefix else ""
-    for i, frame in enumerate(page.frames):
-        try:
-            hits = frame.evaluate("""() => {
-                const res = [];
-                const all = document.querySelectorAll('*');
-                for (const el of all) {
-                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (txt.includes('1 GB') && ['ONE-STACK', 'ONE-USAGE-METER', 'ONE-BUTTON', 'ONE-TEXT', 'BUTTON'].includes(el.tagName)) {
-                        res.push({
-                            tag: el.tagName,
-                            cls: el.className || '',
-                            text: txt.substring(0, 80),
-                            aria: el.getAttribute('aria-label') || ''
-                        });
-                    }
-                }
-                return res;
-            }""")
-            log(f"{p}Frame {i} ({frame.url}): Elemente mit '1 GB': {len(hits)}")
-            for h in hits:
-                log(f"  TREFFER: {h['tag']} | class={h['cls']} | text={h['text']} | aria={h['aria']}")
-        except Exception:
-            pass
-
-
-def click_plus_1gb(page) -> dict:
+def trigger_1gb_refill(page) -> bool:
     """
-    Sucht den '+1 GB' / '1 GB' Button im Inland-Meter und klickt ihn
-    sowohl über Playwright als auch direkt im Shadow DOM an.
+    Klickt den +1 GB Button mit 3 kombinierten Methoden an:
+    1. Playwright Deep-Locator auf den inneren Button von <one-button>
+    2. Echter Mausklick auf die exakten Bildschirmkoordinaten des +1 GB Kreises
+    3. JavaScript Shadow-DOM Click-Dispatch
     """
-    # 1. Status über JS im Shadow DOM prüfen und klicken
-    result = page.evaluate("""() => {
-        // Suche alle one-button Elemente
-        const oneButtons = Array.from(document.querySelectorAll('one-button'));
-        
-        // Filtere nach dem Button, der "1 GB" oder "+1 GB" enthält
-        const target = oneButtons.find(btn => {
-            const txt = (btn.innerText || btn.textContent || '').replace(/\\s+/g, ' ').trim();
-            return txt === '1 GB' || txt === '+1 GB' || txt.includes('1 GB');
-        });
+    clicked = False
 
-        if (!target) {
-            return { found: false, reason: 'Kein <one-button> mit 1 GB gefunden' };
-        }
-
-        const outerHtml = target.outerHTML.substring(0, 220);
-        target.scrollIntoView({ behavior: 'instant', block: 'center' });
-
-        // Prüfe auf inneren Button im Shadow DOM
-        let innerBtn = null;
-        if (target.shadowRoot) {
-            innerBtn = target.shadowRoot.querySelector('button, a, [role="button"]');
-        }
-
-        const isDisabled = (innerBtn && innerBtn.disabled) || target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true';
-
-        // Klick-Events feuern
-        const eventOpts = { bubbles: true, cancelable: true, composed: true, view: window };
-        
-        if (innerBtn) {
-            innerBtn.focus();
-            innerBtn.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-            innerBtn.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-            innerBtn.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-            innerBtn.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-            innerBtn.click();
-        }
-        
-        target.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-        target.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-        target.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-        target.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-        target.click();
-
-        return {
-            found: true,
-            outerHtml: outerHtml,
-            hasShadowButton: !!innerBtn,
-            disabled: isDisabled
-        };
-    }""")
-
-    # 2. Zusätzlich echten Playwright-Mausklick auf die Koordinaten des Buttons ausführen
+    # Methode 1: Gezielter Locator auf one-button im Inland Usage-Meter
     try:
-        loc = page.locator("one-usage-meter one-button, one-button[slot='action']").filter(has_text="1 GB").first
-        if loc.count() > 0 and loc.is_visible():
-            box = loc.bounding_box()
-            if box:
-                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                log("Playwright-Mausklick auf Koordinaten von <one-button> ausgeführt.")
-            else:
-                loc.click(force=True)
-    except Exception as e:
-        log(f"Hinweis beim zusätzlichen Locator-Klick: {e}")
+        btn_locator = (
+            page.locator("one-usage-meter")
+            .filter(has_text="Inland")
+            .locator("one-button")
+            .filter(has_text="1 GB")
+            .first
+        )
+        if btn_locator.count() == 0:
+            btn_locator = page.locator("one-button[slot='action']").filter(has_text="1 GB").first
 
-    return result
+        if btn_locator.count() > 0:
+            btn_locator.scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
+
+            # Versuche zuerst auf das innere <button> Element im Shadow-DOM zu klicken
+            inner_btn = btn_locator.locator("button").first
+            if inner_btn.count() > 0:
+                inner_btn.click(force=True)
+                log("Methode 1a: Innerer <button> per Playwright-Locator geklickt.")
+                clicked = True
+            else:
+                btn_locator.click(force=True)
+                log("Methode 1b: <one-button> per Playwright-Locator geklickt.")
+                clicked = True
+
+            # Methode 2: Echter Hardware-Mausklick auf die Mitte des runden +1 GB Buttons
+            box = btn_locator.bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                page.mouse.move(cx, cy)
+                page.wait_for_timeout(200)
+                page.mouse.down()
+                page.wait_for_timeout(100)
+                page.mouse.up()
+                log(f"Methode 2: Echter Mausklick auf Koordinaten ({cx:.1f}, {cy:.1f}) ausgeführt.")
+                clicked = True
+    except Exception as e:
+        log(f"Hinweis bei Methode 1/2: {e}")
+
+    # Methode 3: JavaScript Shadow-DOM Event-Dispatch (falls Event-Listener am inneren Button hängt)
+    try:
+        js_res = page.evaluate(
+            """() => {
+            const oneButtons = Array.from(document.querySelectorAll('one-button'));
+            const target = oneButtons.find(b => (b.innerText || b.textContent || '').includes('1 GB'));
+            if (!target) return null;
+
+            const inner = target.shadowRoot ? target.shadowRoot.querySelector('button, a, [role="button"]') : null;
+            const el = inner || target;
+
+            const opts = { bubbles: true, cancelable: true, composed: true, view: window };
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.click();
+
+            return target.outerHTML.substring(0, 180);
+        }"""
+        )
+        if js_res:
+            log(f"Methode 3: JS Shadow-DOM Klick ausgelöst auf: {js_res}")
+            clicked = True
+    except Exception as e:
+        log(f"Hinweis bei Methode 3: {e}")
+
+    return clicked
 
 
 # ==============================================================================
@@ -225,7 +205,7 @@ def main():
     log(f"Skript-Version: {SCRIPT_VERSION}")
 
     if not PHONE or not PASSWORD:
-        log("FEHLER: Zugangsdaten (Telefonnummer oder Passwort) fehlen in den Umgebungsvariablen!")
+        log("FEHLER: Telefonnummer oder Passwort fehlen in den Umgebungsvariablen!")
         sys.exit(1)
 
     with sync_playwright() as p:
@@ -237,7 +217,7 @@ def main():
             viewport={"width": 1920, "height": 1080},
             locale="de-DE",
             timezone_id="Europe/Berlin",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
         page = context.new_page()
 
@@ -247,28 +227,26 @@ def main():
             page.wait_for_timeout(3000)
             dismiss_cookies(page)
 
-            # falls wir nicht eingeloggt sind -> Login-Formular ausfüllen
+            # Login-Formular ausfüllen, falls wir noch nicht auf der Übersicht sind
             if "uebersicht" not in page.url or page.locator("input[type='password']").count() > 0:
                 dismiss_cookies(page)
 
-                # Rufnummer-Feld suchen (unterstützt normale Inputs & Shadow DOM von <one-input>)
-                user_filled = False
+                # Rufnummer eingeben
+                filled_user = False
                 for sel in [
+                    "input[type='tel']",
                     "input[name*='phone' i]",
                     "input[name*='user' i]",
                     "input[id*='phone' i]",
-                    "input[id*='user' i]",
-                    "input[type='tel']",
                     "input[type='text']",
                 ]:
                     loc = page.locator(sel).first
                     if loc.count() > 0 and loc.is_visible():
                         loc.fill(PHONE)
-                        user_filled = True
+                        filled_user = True
                         break
 
-                if not user_filled:
-                    # Fallback via JS für Web Components
+                if not filled_user:
                     page.evaluate(
                         """(phone) => {
                         const inputs = Array.from(document.querySelectorAll('input'));
@@ -283,505 +261,116 @@ def main():
                         PHONE,
                     )
 
-                # Passwort-Feld ausfüllen
+                # Passwort eingeben
                 pw_loc = page.locator("input[type='password']").first
                 pw_loc.wait_for(state="visible", timeout=15000)
                 pw_loc.fill(PASSWORD)
 
-                # Login-Button klicken
-                submit_loc = page.locator(
-                    "button[type='submit'], one-button[type='submit'], button:has-text('Anmelden'), one-button:has-text('Anmelden'), button:has-text('Login')"
+                # Anmelden klicken
+                submit_btn = page.locator(
+                    "button[type='submit'], one-button[type='submit'], button:has-text('Anmelden'), one-button:has-text('Anmelden')"
                 ).first
-                if submit_loc.count() > 0:
-                    submit_loc.click()
+                if submit_btn.count() > 0:
+                    submit_btn.click()
                 else:
                     pw_loc.press("Enter")
 
-                # Warten bis die Übersicht geladen ist
-                page.wait_for_url("**/uebersicht**", timeout=30000)
+                page.wait_for_url("**/uebersicht**", timeout=35000)
 
-            # Warten bis das Usage-Meter mit den Verbrauchsdaten geladen ist
+            # Warten bis die Verbrauchs-Kreise geladen sind
             page.wait_for_selector("one-usage-meter, one-stack.usage-meter", timeout=30000)
             page.wait_for_timeout(4000)
             dismiss_cookies(page)
             log("Login OK.")
 
-            # Aktuelles Datenvolumen auslesen
             rem_gb = parse_remaining_gb(page)
             log(f"Restvolumen: {rem_gb} GB")
 
             if rem_gb is not None and rem_gb >= THRESHOLD_GB:
-                log(f"Noch genug Datenvolumen vorhanden ({rem_gb:.2f} GB >= {THRESHOLD_GB} GB). Kein Nachbuchen nötig.")
+                log(f"Volumen ({rem_gb:.3f} GB) ist noch ueber dem Schwellenwert ({THRESHOLD_GB} GB). Nichts zu tun.")
                 sys.exit(0)
 
-            # Debug-Zustand vor dem Klick
-            dump_debug_state(page)
+            # Netzwerk-Traffic mitschneiden, um zu sehen, ob der Klick einen API-Call auslöst
+            api_responses = []
 
-            # +1 GB Button suchen und klicken
-            click_info = click_plus_1gb(page)
-            if not click_info.get("found"):
-                log(f"Button nicht gefunden: {click_info.get('reason')}")
+            def on_response(response):
+                if any(k in response.url.lower() for k in ["portal", "api", "book", "refill", "topup", "tariff", "graphql", "rest"]):
+                    if response.request.resource_type in ["fetch", "xhr", "document"]:
+                        api_responses.append(f"{response.status} {response.request.method} {response.url}")
+
+            page.on("response", on_response)
+
+            # +1 GB Button klicken
+            was_clicked = trigger_1gb_refill(page)
+            if not was_clicked:
+                log("FEHLER: Konnte den +1 GB Button nicht finden oder anklicken.")
                 page.screenshot(path="debug.png", full_page=True)
                 with open("debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
                 sys.exit(1)
 
-            log(f"Button gefunden: {click_info.get('outerHtml')}")
-            log(f"Shadow-Button vorhanden: {click_info.get('hasShadowButton')} | Disabled: {click_info.get('disabled')}")
-
-            if click_info.get("disabled"):
-                log("HINWEIS: Der +1 GB Button ist seitens ALDI TALK noch deaktiviert (disabled=True), da das Volumen noch über der echten 1-GB-Grenze liegt.")
-                sys.exit(0)
-
-            log("+1 GB im Shadow-DOM & per Mausklick ausgelöst. Warte auf Reaktion ...")
-            page.wait_for_timeout(3000)
-
-            # Prüfen, ob ein Bestätigungs-Popup / Modal erschienen ist und ggf. bestätigen
-            modal_clicked = page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('one-button, button'));
-                const confirmBtn = btns.find(b => {
-                    const txt = (b.innerText || b.textContent || '').trim();
-                    return /^(jetzt buchen|bestätigen|ja|kostenpflichtig buchen|buchen|ok)$/i.test(txt);
-                });
-                if (confirmBtn) {
-                    const inner = confirmBtn.shadowRoot ? confirmBtn.shadowRoot.querySelector('button') : null;
-                    if (inner) inner.click();
-                    confirmBtn.click();
-                    return txt;
-                }
-                return null;
-            }""")
-            if modal_clicked:
-                log(f"Bestätigungs-Dialog erkannt und geklickt: {modal_clicked}")
-                page.wait_for_timeout(3000)
-
-            # Warten und Seite neu laden, damit das Portal den neuen Stand vom Server holt
+            log("Warte 5 Sekunden auf Backend-Reaktion oder Bestaetigungs-Popup ...")
             page.wait_for_timeout(5000)
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_selector("one-usage-meter, one-stack.usage-meter", timeout=30000)
-            page.wait_for_timeout(4000)
 
-            # Erfolg prüfen
-            new_gb = parse_remaining_gb(page)
-            log(f"Restvolumen nach Reload: {new_gb} GB")
-
-            # Prüfen, ob das Volumen gestiegen ist oder der +1 GB Button verschwunden ist
-            still_has_btn = page.locator("one-usage-meter one-button").filter(has_text="1 GB").count() > 0
-import os
-import re
-import sys
-import time
-from datetime import datetime
-import urllib.request
-import json
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-# ==============================================================================
-# KONFIGURATION & UMGEBUNGSVARIABLEN
-# ==============================================================================
-SCRIPT_VERSION = "v6-shadowdom-fix"
-
-# Unterstützt verschiedene gängige Namen für die GitHub Secrets / Env-Variablen
-PHONE = (
-    os.getenv("ALDI_PHONE")
-    or os.getenv("ALDITALK_PHONE")
-    or os.getenv("PHONE_NUMBER")
-    or os.getenv("ALDI_USER")
-    or os.getenv("USERNAME")
-    or ""
-).strip()
-
-PASSWORD = (
-    os.getenv("ALDI_PASSWORD")
-    or os.getenv("ALDITALK_PASSWORD")
-    or os.getenv("PASSWORD")
-    or os.getenv("ALDI_PASS")
-    or ""
-).strip()
-
-DISCORD_WEBHOOK = (
-    os.getenv("DISCORD_WEBHOOK")
-    or os.getenv("DISCORD_WEBHOOK_URL")
-    or os.getenv("WEBHOOK_URL")
-    or ""
-).strip()
-
-# Schwellenwert in GB, unter dem nachgebucht werden soll (z. B. 1.05 für ~1024 MB)
-THRESHOLD_GB = float(os.getenv("THRESHOLD_GB", "1.05"))
-HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
-
-LOGIN_URL = "https://www.alditalk-kundenportal.de/portal/auth/uebersicht/"
-
-
-# ==============================================================================
-# HILFSFUNKTIONEN
-# ==============================================================================
-def log(msg: str):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}", flush=True)
-
-
-def send_discord(message: str):
-    if not DISCORD_WEBHOOK:
-        return
-    try:
-        data = json.dumps({"content": message}).encode("utf-8")
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK,
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "AldiRefillBot/1.0"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        log(f"Discord-Fehler: {e}")
-
-
-def dismiss_cookies(page):
-    """Schließt das Usercentrics Cookie-Banner, falls vorhanden."""
-    try:
-        page.evaluate("""() => {
-            // 1. Direkt im DOM suchen
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const accept = buttons.find(b => /akzeptieren|alle akzeptieren|zustimmen|accept all/i.test(b.innerText || ''));
-            if (accept) { accept.click(); return true; }
-
-            // 2. Im Usercentrics Shadow DOM suchen
-            const uc = document.querySelector('#usercentrics-root');
-            if (uc && uc.shadowRoot) {
-                const ucBtns = Array.from(uc.shadowRoot.querySelectorAll('button'));
-                const ucAccept = ucBtns.find(b => /akzeptieren|alle akzeptieren|zustimmen|accept all/i.test(b.innerText || ''));
-                if (ucAccept) { ucAccept.click(); return true; }
-            }
-            return false;
-        }""")
-    except Exception:
-        pass
-
-
-def parse_remaining_gb(page) -> float | None:
-    """Liest das verbleibende Inlands-Datenvolumen in GB aus."""
-    try:
-        text = page.evaluate("""() => {
-            const meters = Array.from(document.querySelectorAll('one-usage-meter, one-stack.usage-meter'));
-            for (const m of meters) {
-                const t = m.innerText || m.textContent || '';
-                if (t.includes('Inland') && !t.includes('Inland & EU')) {
-                    return t;
-                }
-            }
-            return document.body.innerText || '';
-        }""")
-
-        # Suche nach Muster wie "Noch 1021,9 MB von 25 GB" oder "Noch 4,5 GB von 25 GB"
-        match = re.search(r"Noch\s*([\d.,]+)\s*(MB|GB)", text, re.IGNORECASE)
-        if match:
-            val_str = match.group(1).replace(".", "").replace(",", ".")
-            unit = match.group(2).upper()
-            val = float(val_str)
-            if unit == "MB":
-                return val / 1024.0
-            return val
-    except Exception as e:
-        log(f"Fehler beim Auslesen des Volumens: {e}")
-    return None
-
-
-def dump_debug_state(page, prefix=""):
-    """Gibt Debug-Informationen zu allen relevanten Elementen aus."""
-    p = f"{prefix}: " if prefix else ""
-    for i, frame in enumerate(page.frames):
-        try:
-            hits = frame.evaluate("""() => {
-                const res = [];
-                const all = document.querySelectorAll('*');
-                for (const el of all) {
-                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (txt.includes('1 GB') && ['ONE-STACK', 'ONE-USAGE-METER', 'ONE-BUTTON', 'ONE-TEXT', 'BUTTON'].includes(el.tagName)) {
-                        res.push({
-                            tag: el.tagName,
-                            cls: el.className || '',
-                            text: txt.substring(0, 80),
-                            aria: el.getAttribute('aria-label') || ''
-                        });
+            # Falls ein Bestätigungs-Modal aufgeht (z.B. "Jetzt buchen" / "Bestätigen"), dieses auch anklicken
+            modal_btn = page.evaluate(
+                """() => {
+                const allBtns = Array.from(document.querySelectorAll('one-button, button'));
+                for (const b of allBtns) {
+                    const t = (b.innerText || b.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (/^(jetzt buchen|bestätigen|ja|kostenpflichtig buchen|buchen|ok|weiter)$/i.test(t)) {
+                        const inner = b.shadowRoot ? b.shadowRoot.querySelector('button') : null;
+                        if (inner) inner.click();
+                        b.click();
+                        return t;
                     }
                 }
-                return res;
-            }""")
-            log(f"{p}Frame {i} ({frame.url}): Elemente mit '1 GB': {len(hits)}")
-            for h in hits:
-                log(f"  TREFFER: {h['tag']} | class={h['cls']} | text={h['text']} | aria={h['aria']}")
-        except Exception:
-            pass
-
-
-def click_plus_1gb(page) -> dict:
-    """
-    Sucht den '+1 GB' / '1 GB' Button im Inland-Meter und klickt ihn
-    sowohl über Playwright als auch direkt im Shadow DOM an.
-    """
-    # 1. Status über JS im Shadow DOM prüfen und klicken
-    result = page.evaluate("""() => {
-        // Suche alle one-button Elemente
-        const oneButtons = Array.from(document.querySelectorAll('one-button'));
-        
-        // Filtere nach dem Button, der "1 GB" oder "+1 GB" enthält
-        const target = oneButtons.find(btn => {
-            const txt = (btn.innerText || btn.textContent || '').replace(/\\s+/g, ' ').trim();
-            return txt === '1 GB' || txt === '+1 GB' || txt.includes('1 GB');
-        });
-
-        if (!target) {
-            return { found: false, reason: 'Kein <one-button> mit 1 GB gefunden' };
-        }
-
-        const outerHtml = target.outerHTML.substring(0, 220);
-        target.scrollIntoView({ behavior: 'instant', block: 'center' });
-
-        // Prüfe auf inneren Button im Shadow DOM
-        let innerBtn = null;
-        if (target.shadowRoot) {
-            innerBtn = target.shadowRoot.querySelector('button, a, [role="button"]');
-        }
-
-        const isDisabled = (innerBtn && innerBtn.disabled) || target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true';
-
-        // Klick-Events feuern
-        const eventOpts = { bubbles: true, cancelable: true, composed: true, view: window };
-        
-        if (innerBtn) {
-            innerBtn.focus();
-            innerBtn.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-            innerBtn.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-            innerBtn.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-            innerBtn.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-            innerBtn.click();
-        }
-        
-        target.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-        target.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-        target.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-        target.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-        target.click();
-
-        return {
-            found: true,
-            outerHtml: outerHtml,
-            hasShadowButton: !!innerBtn,
-            disabled: isDisabled
-        };
-    }""")
-
-    # 2. Zusätzlich echten Playwright-Mausklick auf die Koordinaten des Buttons ausführen
-    try:
-        loc = page.locator("one-usage-meter one-button, one-button[slot='action']").filter(has_text="1 GB").first
-        if loc.count() > 0 and loc.is_visible():
-            box = loc.bounding_box()
-            if box:
-                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                log("Playwright-Mausklick auf Koordinaten von <one-button> ausgeführt.")
-            else:
-                loc.click(force=True)
-    except Exception as e:
-        log(f"Hinweis beim zusätzlichen Locator-Klick: {e}")
-
-    return result
-
-
-# ==============================================================================
-# HAUPTPROGRAMM
-# ==============================================================================
-def main():
-    log(f"Skript-Version: {SCRIPT_VERSION}")
-
-    if not PHONE or not PASSWORD:
-        log("FEHLER: Zugangsdaten (Telefonnummer oder Passwort) fehlen in den Umgebungsvariablen!")
-        sys.exit(1)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="de-DE",
-            timezone_id="Europe/Berlin",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-
-        try:
-            log("Login laeuft ...")
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
-            dismiss_cookies(page)
-
-            # falls wir nicht eingeloggt sind -> Login-Formular ausfüllen
-            if "uebersicht" not in page.url or page.locator("input[type='password']").count() > 0:
-                dismiss_cookies(page)
-
-                # Rufnummer-Feld suchen (unterstützt normale Inputs & Shadow DOM von <one-input>)
-                user_filled = False
-                for sel in [
-                    "input[name*='phone' i]",
-                    "input[name*='user' i]",
-                    "input[id*='phone' i]",
-                    "input[id*='user' i]",
-                    "input[type='tel']",
-                    "input[type='text']",
-                ]:
-                    loc = page.locator(sel).first
-                    if loc.count() > 0 and loc.is_visible():
-                        loc.fill(PHONE)
-                        user_filled = True
-                        break
-
-                if not user_filled:
-                    # Fallback via JS für Web Components
-                    page.evaluate(
-                        """(phone) => {
-                        const inputs = Array.from(document.querySelectorAll('input'));
-                        const tel = inputs.find(i => i.type === 'tel' || i.type === 'text');
-                        if (tel) {
-                            tel.focus();
-                            tel.value = phone;
-                            tel.dispatchEvent(new Event('input', { bubbles: true }));
-                            tel.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }""",
-                        PHONE,
-                    )
-
-                # Passwort-Feld ausfüllen
-                pw_loc = page.locator("input[type='password']").first
-                pw_loc.wait_for(state="visible", timeout=15000)
-                pw_loc.fill(PASSWORD)
-
-                # Login-Button klicken
-                submit_loc = page.locator(
-                    "button[type='submit'], one-button[type='submit'], button:has-text('Anmelden'), one-button:has-text('Anmelden'), button:has-text('Login')"
-                ).first
-                if submit_loc.count() > 0:
-                    submit_loc.click()
-                else:
-                    pw_loc.press("Enter")
-
-                # Warten bis die Übersicht geladen ist
-                page.wait_for_url("**/uebersicht**", timeout=30000)
-
-            # Warten bis das Usage-Meter mit den Verbrauchsdaten geladen ist
-            page.wait_for_selector("one-usage-meter, one-stack.usage-meter", timeout=30000)
-            page.wait_for_timeout(4000)
-            dismiss_cookies(page)
-            log("Login OK.")
-
-            # Aktuelles Datenvolumen auslesen
-            rem_gb = parse_remaining_gb(page)
-            log(f"Restvolumen: {rem_gb} GB")
-
-            if rem_gb is not None and rem_gb >= THRESHOLD_GB:
-                log(f"Noch genug Datenvolumen vorhanden ({rem_gb:.2f} GB >= {THRESHOLD_GB} GB). Kein Nachbuchen nötig.")
-                sys.exit(0)
-
-            # Debug-Zustand vor dem Klick
-            dump_debug_state(page)
-
-            # +1 GB Button suchen und klicken
-            click_info = click_plus_1gb(page)
-            if not click_info.get("found"):
-                log(f"Button nicht gefunden: {click_info.get('reason')}")
-                page.screenshot(path="debug.png", full_page=True)
-                with open("debug.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                sys.exit(1)
-
-            log(f"Button gefunden: {click_info.get('outerHtml')}")
-            log(f"Shadow-Button vorhanden: {click_info.get('hasShadowButton')} | Disabled: {click_info.get('disabled')}")
-
-            if click_info.get("disabled"):
-                log("HINWEIS: Der +1 GB Button ist seitens ALDI TALK noch deaktiviert (disabled=True), da das Volumen noch über der echten 1-GB-Grenze liegt.")
-                sys.exit(0)
-
-            log("+1 GB im Shadow-DOM & per Mausklick ausgelöst. Warte auf Reaktion ...")
-            page.wait_for_timeout(3000)
-
-            # Prüfen, ob ein Bestätigungs-Popup / Modal erschienen ist und ggf. bestätigen
-            modal_clicked = page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('one-button, button'));
-                const confirmBtn = btns.find(b => {
-                    const txt = (b.innerText || b.textContent || '').trim();
-                    return /^(jetzt buchen|bestätigen|ja|kostenpflichtig buchen|buchen|ok)$/i.test(txt);
-                });
-                if (confirmBtn) {
-                    const inner = confirmBtn.shadowRoot ? confirmBtn.shadowRoot.querySelector('button') : null;
-                    if (inner) inner.click();
-                    confirmBtn.click();
-                    return txt;
-                }
                 return null;
-            }""")
-            if modal_clicked:
-                log(f"Bestätigungs-Dialog erkannt und geklickt: {modal_clicked}")
-                page.wait_for_timeout(3000)
+            }"""
+            )
+            if modal_btn:
+                log(f"Bestaetigungs-Button gefunden und geklickt: '{modal_btn}'")
+                page.wait_for_timeout(5000)
 
-            # Warten und Seite neu laden, damit das Portal den neuen Stand vom Server holt
-            page.wait_for_timeout(5000)
-            page.reload(wait_until="domcontentloaded")
+            if api_responses:
+                log(f"Erfasste API-Aufrufe nach dem Klick ({len(api_responses)}):")
+                for r in api_responses[:10]:
+                    log(f"  -> {r}")
+            else:
+                log("WARNUNG: Kein XHR/Fetch-Netzwerkaufruf direkt nach dem Klick erkannt.")
+
+            # Seite neu laden, um das aktualisierte Datenvolumen zu prüfen
+            log("Lade Uebersichtsseite neu, um neues Volumen zu pruefen ...")
+            page.reload(wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("one-usage-meter, one-stack.usage-meter", timeout=30000)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(5000)
 
-            # Erfolg prüfen
             new_gb = parse_remaining_gb(page)
             log(f"Restvolumen nach Reload: {new_gb} GB")
 
-            # Prüfen, ob das Volumen gestiegen ist oder der +1 GB Button verschwunden ist
-            still_has_btn = page.locator("one-usage-meter one-button").filter(has_text="1 GB").count() > 0
+            # Prüfen, ob der +1 GB Button verschwunden ist oder das Volumen gestiegen ist
+            btn_still_there = (
+                page.locator("one-usage-meter")
+                .filter(has_text="Inland")
+                .locator("one-button")
+                .filter(has_text="1 GB")
+                .count()
+                > 0
+            )
 
-            if (new_gb is not None and rem_gb is not None and new_gb > rem_gb + 0.1) or not still_has_btn:
-                log(f"ERFOLG! +1 GB wurde erfolgreich gebucht (Neues Volumen: {new_gb} GB).")
-                send_discord(f"✅ **ALDI TALK:** +1 GB erfolgreich nachgebucht! Neues Datenvolumen: **{new_gb:.2f} GB**")
+            if (new_gb is not None and rem_gb is not None and new_gb > rem_gb + 0.05) or not btn_still_there:
+                log(f"ERFOLG! +1 GB wurde gebucht! (Vorher: {rem_gb:.3f} GB -> Nachher: {new_gb} GB)")
+                send_discord(f"✅ **ALDI TALK:** +1 GB erfolgreich nachgebucht! Neues Volumen: **{new_gb:.2f} GB**")
                 sys.exit(0)
             else:
-                log("Kein Erfolg erkennbar - Zustand nach dem Klick:")
-                dump_debug_state(page, prefix="NACH KLICK")
+                log("Kein Volumen-Anstieg nach dem Klick erkennbar. Speichere debug.png und debug.html ...")
                 page.screenshot(path="debug.png", full_page=True)
                 with open("debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
-                log("Siehe auch debug.png und debug.html.")
-                log("Ergebnis: unclear")
                 sys.exit(1)
 
         except Exception as e:
-            log(f"Ausnahmefehler im Skript: {e}")
-            try:
-                page.screenshot(path="debug.png", full_page=True)
-                with open("debug.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-            except Exception:
-                pass
-            sys.exit(1)
-        finally:
-            browser.close()
-
-
-if __name__ == "__main__":
-    main()
-            if (new_gb is not None and rem_gb is not None and new_gb > rem_gb + 0.1) or not still_has_btn:
-                log(f"ERFOLG! +1 GB wurde erfolgreich gebucht (Neues Volumen: {new_gb} GB).")
-                send_discord(f"✅ **ALDI TALK:** +1 GB erfolgreich nachgebucht! Neues Datenvolumen: **{new_gb:.2f} GB**")
-                sys.exit(0)
-            else:
-                log("Kein Erfolg erkennbar - Zustand nach dem Klick:")
-                dump_debug_state(page, prefix="NACH KLICK")
-                page.screenshot(path="debug.png", full_page=True)
-                with open("debug.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                log("Siehe auch debug.png und debug.html.")
-                log("Ergebnis: unclear")
-                sys.exit(1)
-
-        except Exception as e:
-            log(f"Ausnahmefehler im Skript: {e}")
+            log(f"Ausnahmefehler: {e}")
             try:
                 page.screenshot(path="debug.png", full_page=True)
                 with open("debug.html", "w", encoding="utf-8") as f:
